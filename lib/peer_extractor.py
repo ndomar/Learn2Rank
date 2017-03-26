@@ -13,7 +13,7 @@ class PeerExtractor(object):
 
 
 	def __init__(self, ratings, documents, method, similarity_metric, k):
-		
+		print("*** PEER EXTRACTOR INIT ***")
 		self.ratings = ratings
 		self.method = method
 		self.k = k
@@ -21,6 +21,7 @@ class PeerExtractor(object):
 		self.similarity_metric = similarity_metric
 		self.pairs = {}
 		self.similarity_matrix = None
+		print("*** Calculating Similarity ***")
 		self.calculate_pairwise_similarity()
 
 	def get_similarity_matrix(self):
@@ -34,28 +35,33 @@ class PeerExtractor(object):
 			if self.method == 'least_k':
 				self.pairs[user] = self.get_least_k(user)
 			else: 
-				self.pairs[user] = get_least_similar_k(user)
+				self.pairs[user] = self.get_least_similar_k(user)
 
 		return self.pairs[user]
 
 	def get_least_k(self, user):
-		poitive_papers = self.ratings[user].nonzero()[0]
+		## TODO Add it
+		pass
+
+	def get_least_similar_k(self, user):
+		## Randomize
+		positive_papers = self.ratings[user].nonzero()[0]
 		negative_papers = np.where(self.ratings[user] == 0)[0]
 		user_ratings = self.ratings[user]
 		top_similar = TopSimilar(self.k)
-		for index, rating in enumerate(user_ratings):
-			top_similar.insert(index, 1 - rating)
-		return top_similar.get_indices()
-
-	def get_least_similar_k(self, user):
-		poitive_papers = self.ratings[user].nonzero()[0]
-		negative_papers = np.where(self.ratings[user] == 0)[0]
-		user_ratings = self.ratings[user].nonzero()[0]
-		top_similar = TopSimilar(self.k)
-		for index in user_ratings:
-			rating = 1 - self.ratings[user][index]
-			top_similar.insert(index, rating)
-		return top_similar.get_indices()		
+		pairs = []
+		for paper in positive_papers:
+			top_similar = TopSimilar(self.k)
+			## Get papers with non zero similarity
+			nonzeros = self.similarity_matrix[paper].nonzero()[0]
+			for index in nonzeros:
+				if paper == index:
+					continue
+				top_similar.insert(index, 1 - self.similarity_matrix[user][index])
+			similar_papers = top_similar.get_indices()
+			for similar_paper in similar_papers:
+				pairs.append((paper, similar_paper))
+		return pairs
 
 
 	def get_random_peer_papers(self, user):
@@ -86,5 +92,10 @@ class PeerExtractor(object):
 
 		if self.similarity_metric == 'cosine':
 			self.similarity_matrix = cosine_similarity(sparse.csr_matrix(self.documents))
+		#self.similarity_matrix[self.similarity_matrix == 1.0] = 0
+		similarity_matrix = self.documents.dot(self.documents.T)
 
+	def get_textual_similarity(self, user, paper):
+		liked_papers = self.ratings[user].nonzero()
+		return self.similarity_matrix[paper][liked_papers].max()
 

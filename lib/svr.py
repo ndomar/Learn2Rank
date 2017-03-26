@@ -6,8 +6,11 @@ from util.data_parser import DataParser
 from util.keyword_extractor import KeywordExtractor
 from lib.peer_extractor import PeerExtractor
 import numpy as np
-from sklearn.svm import SVR as SKSVR
+from sklearn.svm import SVC as SKSVR
+from util.top_similar import TopSimilar as TopRecommendations
+from scipy import sparse
 import datetime
+import sys
 
 class SVR(object):
 
@@ -17,29 +20,34 @@ class SVR(object):
 		print("*** PARSING DATA ***")
 		self.parser = DataParser(self.DATASET)
 		print("*** DATA PARSED ***")
-		print("*** EXTRACTING KEYWORDS ***")
-		labels, data = self.parser.get_raw_data()
-		self.keyword_extractor = KeywordExtractor(labels, data, self.DATASET)
-		self.documents_matrix = self.keyword_extractor.get_tfidf()
+		# print("*** EXTRACTING KEYWORDS ***")
+		# labels, data = self.parser.get_raw_data()
+		# self.keyword_extractor = KeywordExtractor(labels, data, self.DATASET)
+		# self.documents_matrix = self.keyword_extractor.get_tfidf()
+		self.documents_matrix = self.parser.get_document_word_distribution()
 		print("*** KEYWORDS EXTRACTED ***")
 		self.ratings = self.parser.get_ratings_matrix()
 		self.k_folds = 5
-		self.fold_train_indices, self.fold_test_indices = self.get_kfold_indices()
+		self.train_indices, self.test_indices = self.get_kfold_indices()
 		self.train()
 
-	def get_test_documents(self, fold):
-		_, test_indices = self.get_fold_indices(fold, self.fold_train_indices, self.fold_test_indices)
+	def get_test_documents(self, test_indices, user):
 		documents = []
-		for index in test_indices:
+		indices = []
+		for index in test_indices[user]:
 			documents.append(self.documents_matrix[index])
-			break
-		return np.array(documents)
+			indices.append(index)
+		return np.array(documents), np.array(indices)
 
 	def train(self):
-
+		print("*** TRAINING ***")
+		ndcgs = []
+		mrrs = []
 		for fold in range(self.k_folds):
-			self.train_data, self.test_data = self.get_fold(fold, self.fold_train_indices, self.fold_test_indices)
-			self.peer_extractor = PeerExtractor(self.train_data, self.documents_matrix, 'random', 'cosine', 5)
+			self.fold_train_indices, self.fold_test_indices = self.get_fold_indices(fold, self.train_indices, self.test_indices)
+			self.train_data, self.test_data = self.get_fold(fold, self.train_indices, self.test_indices)
+			## TODO Look at the users that have p+ p+ as pair
+			self.peer_extractor = PeerExtractor(self.train_data, self.documents_matrix, 'least_similar_k', 'cosine', 20)
 			self.similarity_matrix = self.peer_extractor.get_similarity_matrix()
 			for user in range(self.ratings.shape[0]):
 				pairs = self.peer_extractor.get_user_peer_papers(user)
@@ -48,32 +56,94 @@ class SVR(object):
 				print("*** BUILDNG PAIRS ***")
 				i = 0
 				for pair in pairs:
-					feature_vector, label = self.build_vector_label(pair)
-					feature_vectors.append(feature_vector)
-					labels.append(label)
+					# self.parser.get_author_similarity(pair[1], self.ratings[user].nonzero())
+					feature_vector, label = self.build_vector_label_svm(pair, user)
+					feature_vectors.append(feature_vector[0])
+					feature_vectors.append(feature_vector[1])
+					labels.append(label[0])
+					labels.append(label[1])
 					i += 1
 				print("*** PAIRS BUILT ***")
 				feature_vectors = np.array(feature_vectors)
-				print(feature_vectors.shape)
 				print("*** FITTING SVR MODEL ***")
 				t0 = datetime.datetime.now()
-				clf = SKSVR(verbose=True, C=1, epsilon=0.2)
-				clf.fit(feature_vectors, labels)
+				clf = SKSVR(verbose=True)
+				print("Vectors size are {}".format(feature_vectors.shape))
+				clf.fit((feature_vectors), labels)
 				print("took {}".format(datetime.datetime.now() - t0))
 				print("*** FITTED SVR FOR USER {} ***".format(user))
-				test_documents = self.get_test_documents(fold)
-				print(test_documents.shape)
-				predictions = clf.predict(test_documents)
+				print(self.fold_test_indices[user])
+				test_documents, test_indices = self.get_test_documents(self.fold_test_indices, user)
+				predictions = clf.decision_function(test_documents)
+				ndcg_at_10, mrr_at_10 = self.evaluate(user, predictions, test_indices, 10)
+				ndcgs.append(ndcg_at_10)
+				mrrs.append(mrr_at_10)
+				print("NDCG @ 10 = {} for user {}".format(ndcg_at_10, user))
+				print("NDCG Mean so far {}".format(np.array(ndcgs).mean()))
+				print("MRR @ 10 = {} for user {}".format(mrr_at_10, user))
+				print("MRR Mean so far {}".format(np.array(mrrs).mean()))
+			print("Average NDCG is {} for fold {}".format(np.array(ndcgs).mean(), fold))
+			print("Average MRR is {} for fold {}".format(np.array(mrr).mean(), fold))
 
 
-	def build_vector_label(self, pair):
+	def evaluate(self, user, predictions, test_indices, k):
+		dcg = 0.0
+		idcg = 0.0
+		mrr = 0.0
+		ndcgs = []
+		top_predictions = TopRecommendations(k)
+		for prediction, index in zip(predictions, test_indices):
+			top_predictions.insert(index, prediction)
+		recommendation_indices = top_predictions.get_indices()
+		for pos_index, index in enumerate(recommendation_indices):
+			hit_found = False
+			dcg += (self.ratings[user][index] / np.log2(pos_index + 2))
+			idcg += 1 / np.log2(pos_index + 2)
+			if self.ratings[user][index] == 1 and mrr == 0.0:
+				mrr = 1.0 / (pos_index + 1) * 1.0
+			if pos_index + 1 == k:
+				break
+		if idcg != 0:
+			return (dcg / idcg), mrr
+		return 0, mrr
+
+	def get_user_paper_similarity(self, user, paper):
+		liked_papers = self.ratings[user].nonzero()[0]
+		return self.similarity_matrix[paper][liked_papers].max()
+
+	def build_vector_label(self, pair, user):
 		pivot = pair[0]
 		peer = pair[1]
-		feature_vector = self.documents_matrix[pivot] - self.documents_matrix[peer]
-		label = 1 - self.similarity_matrix[pivot][peer]
+		feature_vector = []
+		label = []
+		feature_vector.append((self.documents_matrix[pivot] - self.documents_matrix[peer]) * self.get_confidence(user, peer))
+		label.append(1 - self.similarity_matrix[pivot][peer])
+		feature_vector.append((self.documents_matrix[peer] - self.documents_matrix[pivot]) * self.get_confidence(user, peer))
+		label.append(1 - self.similarity_matrix[pivot][peer])
+		# feature_vector = (self.documents_matrix[pivot] - self.documents_matrix[peer]) * self.get_user_paper_similarity(user, peer)
+		# label = self.similarity_matrix[pivot][peer]
 		return feature_vector, label
 
+	def build_vector_label_svm(self, pair, user):
+		pivot = pair[0]
+		peer = pair[1]
+		feature_vector = []
+		label = []
+		feature_vector.append((self.documents_matrix[pivot] - self.documents_matrix[peer]) * self.get_user_paper_similarity(user, peer))
+		label.append(1)
+		feature_vector.append((self.documents_matrix[peer] - self.documents_matrix[pivot]) * self.get_user_paper_similarity(user, peer))
+		label.append(-1)
+		return feature_vector, label
 
+	def get_confidence(self, user, paper):
+		user_papers = self.train_data[user].nonzero()[0]
+		author_similarity = self.parser.get_author_similarity(paper, user_papers)
+		conference_similarity = self.parser.get_conference_similarity(paper, user_papers)
+		textual_similarity = self.get_user_paper_similarity(user, paper)
+		textual_similarity = (textual_similarity * 2) - 1
+		author_similarity += 1
+		conference_similarity += 1
+		return (0.5 - ((1/8) * (conference_similarity * author_similarity * textual_similarity)))
 
 	def get_fold(self, fold_num, fold_train_indices, fold_test_indices):
 		"""
@@ -111,7 +181,7 @@ class SVR(object):
 			current_train_fold_indices.append(fold_train_indices[index])
 			current_test_fold_indices.append(fold_test_indices[index])
 			index += self.k_folds
-		return current_train_fold_indices, current_test_fold_indices
+		return (current_train_fold_indices, current_test_fold_indices)
 
 	def get_kfold_indices(self):
 		"""
